@@ -1,104 +1,101 @@
-name: SSH on Debian
+name: Linux SSH over Tailscale
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # 允许手动触发
 
 jobs:
   secure-ssh:
-    runs-on: debian-latest
-    timeout-minutes: 3600
+    runs-on: ubuntu-latest # 使用 Ubuntu Linux 运行器
+    timeout-minutes: 3600 # 设置超时，避免长时间占用
 
     steps:
-      - name: Install OpenSSH Server
+      - name: Checkout repository (optional)
+        uses: actions/checkout@v4 # 如果后续步骤需要代码，可以签出仓库
+
+      - name: Install Tailscale and SSH server
         run: |
+          set -x # 打开调试模式，方便查看日志
+
+          # 安装 Tailscale
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+          # 更新系统并安装 OpenSSH 服务器
           sudo apt-get update
-          # 安装 OpenSSH 服务器
-          sudo apt-get install -y openssh-server [1,3](@ref)
-          # 启动 SSH 服务并设置开机自启 [3](@ref)
-          sudo systemctl start ssh
+          sudo apt-get install -y openssh-server
+
+          # 配置 SSH 服务器
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
+          echo "PasswordAuthentication no" | sudo tee -a /etc/ssh/sshd_config
+          echo "PermitRootLogin no" | sudo tee -a /etc/ssh/sshd_config
+
+          # 启动 SSH 服务
           sudo systemctl enable ssh
-          # 验证服务状态 [3](@ref)
-          sudo systemctl status ssh
+          sudo systemctl start ssh
 
-      - name: Configure SSH for Enhanced Security
+      - name: Generate and authorize SSH key
         run: |
-          # 备份原始配置文件
-          sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
-          # 使用密码认证（方便临时访问，可根据需要关闭）
-          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          # 确保允许密码认证
-          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          # 可选：更改默认端口以减少随机攻击 [1,5](@ref)
-          # sudo sed -i 's/#Port 22/Port 2222/' /etc/ssh/sshd_config
-          # 重启 SSH 服务以使配置生效 [3](@ref)
-          sudo systemctl restart ssh
+          # 生成专用于此次连接的 SSH 密钥对
+          ssh-keygen -t ed25519 -f /tmp/github_action_ssh -N ""
 
-      - name: Configure Firewall (UFW)
-        run: |
-          # 开放 SSH 端口（如果修改了端口，这里也需要相应调整）
-          sudo ufw allow ssh [3,4](@ref)
-          # 如果你修改了 SSH 端口，例如 2222，则应使用：
-          # sudo ufw allow 2222/tcp [1](@ref)
-          sudo ufw --force enable  # 启用防火墙
-          sudo ufw reload
+          # 将公钥添加到授权密钥列表，允许连接
+          mkdir -p ~/.ssh
+          cat /tmp/github_action_ssh.pub >> ~/.ssh/authorized_keys
 
-      - name: Create SSH User and Secure Password
-        run: |
-          # 生成随机密码
-          PASSWORD=$(openssl rand -base64 16)
-          # 创建用户（此处用户名为 cli-user，可自定义）
-          sudo useradd -m -s /bin/bash cli-user
-          echo "cli-user:$PASSWORD" | sudo chpasswd
-          # 将用户加入 sudo 组（可选，如果你需要该用户有管理员权限）
-          sudo usermod -aG sudo cli-user
-          # 将凭证保存到 GitHub Actions 环境变量
-          echo "SSH_CREDS=User: cli-user | Password: $PASSWORD" >> $GITHUB_ENV
+          # 显示公钥（用于调试，可选）
+          echo "生成的公钥是："
+          cat /tmp/github_action_ssh.pub
 
-      - name: Install Tailscale
-        run: |
-          # 遵循 Tailscale 官方指南安装 [5](@ref)
-          curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
-          sudo apt-get update
-          sudo apt-get install -y tailscale
+          # 将私钥保存为工作流输出，后续连接使用
+          echo "PRIVATE_KEY<<EOF" >> $GITHUB_OUTPUT
+          cat /tmp/github_action_ssh >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        id: ssh_key
 
-      - name: Establish Tailscale Connection
+      - name: Establish Tailscale connection
         run: |
-          # 启动 Tailscale
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-cli-$GITHUB_RUN_ID
-          # 获取 Tailscale IP
-          TS_IP=""
-          for i in {1..10}; do
-            TS_IP=$(sudo tailscale ip -4)
-            if [ -n "$TS_IP" ]; then
-              break
-            fi
-            sleep 5
-          done
-          if [ -z "$TS_IP" ]; then
-            echo "Failed to get Tailscale IP"
-            exit 1
+          # 使用认证密钥加入 Tailscale 网络，并设置唯一的主机名
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-linux-runner-$GITHUB_RUN_ID
+
+          # 获取 Tailscale 分配的 IP 地址
+          TAILSCALE_IP=$(sudo tailscale ip -4)
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+
+          # 等待网络就绪
+          sleep 5
+
+      - name: Verify SSH accessibility
+        run: |
+          echo "尝试通过 Tailscale IP 连接 SSH..."
+          echo "Tailscale IP 是: $TAILSCALE_IP"
+
+          # 简单测试 SSH 端口是否开放
+          if nc -z $TAILSCALE_IP 22; then
+            echo "SSH 端口连接测试成功。"
+          else
+            echo "警告：SSH 端口连接测试未成功。"
           fi
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
 
-      - name: Maintain Connection and Output Info
+      - name: Maintain connection and output info
         run: |
           echo " "
-          echo "=== SSH on Debian Access Information ==="
-          echo "Tailscale IP Address: $TAILSCALE_IP"
-          echo "Username: cli-user"
-          echo "Password: $(echo $SSH_CREDS | sed 's/Password: //')" # 安全起见，只显示密码部分
+          echo "=========================================="
+          echo "        Linux SSH 环境已就绪"
+          echo "=========================================="
+          echo "连接地址 (Tailscale IP): $TAILSCALE_IP"
+          echo "SSH 端口: 22"
+          echo "用户名: $USER"
           echo " "
-          echo "SSH Command:"
-          echo "ssh cli-user@$TAILSCALE_IP"
-          # 如果你修改了 SSH 端口，命令应为：
-          # echo "ssh -p 2222 cli-user@$TAILSCALE_IP"
-          echo "========================================"
+          echo "使用以下命令进行连接："
+          echo "ssh -i /path/to/saved/private_key $USER@$TAILSCALE_IP"
           echo " "
-          echo "Keep this workflow running to maintain the SSH connection."
-          echo "The runner will automatically terminate after 60 minutes (or the set timeout), or when you cancel the run."
-          # 保持工作流运行
+          echo "私钥内容已输出到日志中（见前一步骤）。请妥善保存。"
+          echo "此工作流运行器将保持活动状态，直到您手动取消或超时。"
+          echo "=========================================="
+          echo " "
+
+          # 保持运行器活跃
           while true; do
-            echo "[$(date)] SSH session active. Press 'Cancel' in GitHub Actions to terminate."
+            echo "[$(date)] SSH 环境活跃中... (工作流运行 ID: $GITHUB_RUN_ID)"
             sleep 300
           done
