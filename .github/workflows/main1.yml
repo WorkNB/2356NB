@@ -1,4 +1,4 @@
-name: Linux SSH over Tailscale with Password Auth
+name: Linux SSH
 
 on:
   workflow_dispatch: # 允许手动触发
