@@ -1,101 +1,123 @@
-name: Linux SSH over Tailscale
+name: Linux SSH over Tailscale with Password Auth
 
 on:
   workflow_dispatch: # 允许手动触发
 
+env:
+  SSH_USER: runner  # 设置SSH用户名
+
 jobs:
   secure-ssh:
-    runs-on: ubuntu-latest # 使用 Ubuntu Linux 运行器
-    timeout-minutes: 3600 # 设置超时，避免长时间占用
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
 
     steps:
-      - name: Checkout repository (optional)
-        uses: actions/checkout@v4 # 如果后续步骤需要代码，可以签出仓库
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Install Tailscale and SSH server
         run: |
-          set -x # 打开调试模式，方便查看日志
-
+          set -x
           # 安装 Tailscale
           curl -fsSL https://tailscale.com/install.sh | sh
-
-          # 更新系统并安装 OpenSSH 服务器
+          
+          # 安装 OpenSSH 服务器
           sudo apt-get update
           sudo apt-get install -y openssh-server
-
-          # 配置 SSH 服务器
-          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
-          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
-          echo "PasswordAuthentication no" | sudo tee -a /etc/ssh/sshd_config
-          echo "PermitRootLogin no" | sudo tee -a /etc/ssh/sshd_config
-
+          
+          # 配置 SSH 服务器 - 启用密码认证
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          echo "PasswordAuthentication yes" | sudo tee -a /etc/ssh/sshd_config
+          echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config
+          
           # 启动 SSH 服务
           sudo systemctl enable ssh
           sudo systemctl start ssh
 
-      - name: Generate and authorize SSH key
+      - name: Generate SSH password and key
         run: |
-          # 生成专用于此次连接的 SSH 密钥对
+          set -x
+          # 生成随机密码（12位）
+          SSH_PASSWORD=$(openssl rand -base64 12 | tr -d '/+' | cut -c1-12)
+          echo "生成的SSH密码: $SSH_PASSWORD"
+          
+          # 设置用户密码（为当前用户）
+          echo "runner:$SSH_PASSWORD" | sudo chpasswd
+          
+          # 生成SSH密钥对
           ssh-keygen -t ed25519 -f /tmp/github_action_ssh -N ""
-
-          # 将公钥添加到授权密钥列表，允许连接
+          
+          # 授权公钥
           mkdir -p ~/.ssh
           cat /tmp/github_action_ssh.pub >> ~/.ssh/authorized_keys
-
-          # 显示公钥（用于调试，可选）
-          echo "生成的公钥是："
-          cat /tmp/github_action_ssh.pub
-
-          # 将私钥保存为工作流输出，后续连接使用
+          chmod 600 ~/.ssh/authorized_keys
+          
+          # 保存密码和私钥到GITHUB_OUTPUT
+          echo "SSH_PASSWORD=$SSH_PASSWORD" >> $GITHUB_OUTPUT
           echo "PRIVATE_KEY<<EOF" >> $GITHUB_OUTPUT
           cat /tmp/github_action_ssh >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
-        id: ssh_key
+        id: auth_info
 
       - name: Establish Tailscale connection
         run: |
-          # 使用认证密钥加入 Tailscale 网络，并设置唯一的主机名
+          # 使用认证密钥加入 Tailscale 网络
           sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-linux-runner-$GITHUB_RUN_ID
-
-          # 获取 Tailscale 分配的 IP 地址
+          
+          # 获取 Tailscale IP
           TAILSCALE_IP=$(sudo tailscale ip -4)
           echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
-
+          
           # 等待网络就绪
-          sleep 5
+          sleep 10
 
-      - name: Verify SSH accessibility
+      - name: Verify connectivity
         run: |
-          echo "尝试通过 Tailscale IP 连接 SSH..."
-          echo "Tailscale IP 是: $TAILSCALE_IP"
-
-          # 简单测试 SSH 端口是否开放
+          echo "=== 连接测试 ==="
+          echo "Tailscale IP: $TAILSCALE_IP"
+          echo "SSH 端口: 22"
+          
+          # 测试SSH端口
           if nc -z $TAILSCALE_IP 22; then
-            echo "SSH 端口连接测试成功。"
+            echo "✅ SSH 端口连接成功"
           else
-            echo "警告：SSH 端口连接测试未成功。"
+            echo "❌ SSH 端口连接失败"
+            exit 1
           fi
 
-      - name: Maintain connection and output info
+      - name: Display connection information
         run: |
-          echo " "
+          echo ""
           echo "=========================================="
           echo "        Linux SSH 环境已就绪"
           echo "=========================================="
-          echo "连接地址 (Tailscale IP): $TAILSCALE_IP"
-          echo "SSH 端口: 22"
-          echo "用户名: $USER"
-          echo " "
-          echo "使用以下命令进行连接："
-          echo "ssh -i /path/to/saved/private_key $USER@$TAILSCALE_IP"
-          echo " "
-          echo "私钥内容已输出到日志中（见前一步骤）。请妥善保存。"
-          echo "此工作流运行器将保持活动状态，直到您手动取消或超时。"
+          echo "📡 连接地址: $TAILSCALE_IP"
+          echo "🔑 SSH 端口: 22"
+          echo "👤 用户名: $SSH_USER"
+          echo "🔐 密码: ${{ steps.auth_info.outputs.SSH_PASSWORD }}"
+          echo ""
+          echo "=== 连接方式 ==="
+          echo "1. 使用密码认证:"
+          echo "   ssh $SSH_USER@$TAILSCALE_IP"
+          echo "   密码: ${{ steps.auth_info.outputs.SSH_PASSWORD }}"
+          echo ""
+          echo "2. 使用密钥认证:"
+          echo "   ssh -i /path/to/private_key $SSH_USER@$TAILSCALE_IP"
+          echo ""
+          echo "=== 重要提示 ==="
+          echo "• 私钥已保存为工作流输出"
+          echo "• 此工作流将保持运行直到超时或手动取消"
+          echo "• 连接信息仅在本次工作流运行期间有效"
           echo "=========================================="
-          echo " "
+          echo ""
 
+      - name: Keep alive
+        run: |
           # 保持运行器活跃
+          counter=0
           while true; do
-            echo "[$(date)] SSH 环境活跃中... (工作流运行 ID: $GITHUB_RUN_ID)"
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] SSH 环境活跃中... (运行时长: ${counter}分钟)"
+            counter=$((counter + 5))
             sleep 300
           done
